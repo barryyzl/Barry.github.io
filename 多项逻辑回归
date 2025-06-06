@@ -1,0 +1,354 @@
+## 加载需要的包
+library(tidyverse)
+library(readxl)
+library(nnet)
+library(prophet)
+library(ggplot2)
+library(gridExtra)
+library(broom)
+
+###------------------------------数据准备与整合------------------------------###
+# 读取数据
+data1 <- read_excel("C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/【选题2数据】某保险产品肺癌发生率及初次确诊分期分布.xlsx",sheet = 2)
+data2 <- read_excel("C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/【选题2数据】某保险产品肺癌发生率及初次确诊分期分布.xlsx",sheet = 3)
+
+# 更改列名方便后续处理
+colnames(data1) <- c('gender', 'age', 'year','claims','exposure')
+colnames(data2) <- c('gender', 'age', 'stage','year','claims')
+
+# 整理分组
+data2 <- data2 %>%
+  mutate(
+    age_group = case_when(
+      age == '40岁及以下' ~ "<=40",
+      age == '41-50岁' ~ "41-50",
+      age == '51-60岁' ~ "51-60",
+      TRUE ~ "61+"
+    )
+  )
+
+# 按性别、年龄组、年份、分期汇总data2的分期理赔数
+data2_agg <- data2 %>%
+  group_by(gender, age_group, year, stage) %>%
+  summarise(
+    stage_claims = sum(claims),              # 先汇总各分期的理赔数
+    .groups = "drop"
+  ) %>%
+  # 再按性别、年龄组、年份分组计算占比
+  group_by(gender, age_group, year) %>%
+  mutate(
+    total_claims = sum(stage_claims),         # 分组总理赔数
+    stage_prop = stage_claims / total_claims  # 分期占比
+  ) %>%
+  ungroup() %>%  # 解除分组
+  mutate(
+    stage_prop = ifelse(is.nan(stage_prop), 0, stage_prop)  # 处理零除情况
+  )
+
+merged_data <- data2_agg[order(data2_agg$gender, data2_agg$age_group, data2_agg$year), ]
+
+# 删除缺失值（无理赔的组）
+merged_data <- na.omit(merged_data)
+
+###---------------------------描述性统计与基本分析---------------------------###
+# 1. 各分期的总索赔数 & 均值 & 标准差
+desc_stage <- merged_data %>%
+  group_by(stage) %>%
+  summarise(
+    sum_claims = sum(stage_claims),
+    mean_claims = mean(stage_claims),
+    sd_claims   = sd(stage_claims),
+  )
+
+# 2. 性别 + 年龄组 的总理赔 & 平均占比
+desc_gender_age <- merged_data %>%
+  group_by(gender, age_group) %>%
+  summarise(
+    total_claims = sum(stage_claims),
+    avg_prop     = mean(stage_prop)
+  )
+
+# 查看结果
+desc_stage
+desc_gender_age
+
+## 数据可视化
+# 1. 各分期总理赔数柱状图
+p1 <- ggplot(merged_data, aes(x = factor(stage), y = stage_claims)) +
+  stat_summary(fun = sum, geom = "col", fill = "steelblue") +
+  labs(title = "各分期总理赔数",
+       x = "分期",
+       y = "总理赔数") +
+  theme_minimal()
+
+# 2. 年度各分期理赔数趋势折线图
+p2 <- ggplot(merged_data, aes(x = year, y = stage_claims, color = factor(stage))) +
+  stat_summary(fun = sum, geom = "line", size = 1) +
+  labs(title = "年度各分期理赔数趋势",
+       x = "年份",
+       y = "理赔数",
+       color = "分期") +
+  theme_minimal()
+
+g1 <- grid.arrange(p1, p2, ncol = 2)
+# 保存为 JPG 格式
+ggsave(
+  filename = "C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/graph/1.jpg",    # 文件名（扩展名决定格式）
+  plot = g1,                       # 绘图对象
+  width = 8,                       # 宽度（单位英寸）
+  height = 6,                      # 高度（单位英寸）
+  units = "in",                    # 单位（默认英寸）
+  dpi = 300                        # 分辨率（默认 300 dpi）
+)
+
+# 3. 性别 + 年龄组 分期占比热力图 
+# 3.1 聚合：计算性别×年龄组×分期 的平均占比
+heat_data <- merged_data %>%
+  group_by(gender, age_group, stage) %>%
+  summarise(
+    mean_prop = mean(stage_prop, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 3.2 绘图
+g2 <- ggplot(heat_data, aes(x = age_group,
+                      y = factor(stage),
+                      fill = mean_prop)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ gender) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(
+    title = "性别与年龄组下各分期平均占比热力图",
+    x     = "年龄组",
+    y     = "分期",
+    fill  = "平均占比"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+# 保存为 JPG 格式
+ggsave(
+  filename = "C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/graph/2.jpg",    # 文件名（扩展名决定格式）
+  plot = g2,                       # 绘图对象
+  width = 8,                       # 宽度（单位英寸）
+  height = 6,                      # 高度（单位英寸）
+  units = "in",                    # 单位（默认英寸）
+  dpi = 300                        # 分辨率（默认 300 dpi）
+)
+
+
+
+###------------------------差异解释模型：多项逻辑回归------------------------###
+# 将分类变量转为因子变量
+merged_data <- merged_data %>%
+  mutate(across(c("gender","age_group","stage"), as.factor))
+
+# 对年份去中心化，让截距对应一个真实存在的时点
+merged_data <- merged_data %>%
+  mutate(year_c = year - mean(year))
+
+# 训练多项逻辑回归模型
+model <- multinom(
+  stage ~ gender + age_group + year_c,
+  data = merged_data,
+  weights = stage_claims
+)
+
+summary(model)
+
+# 用broom::tidy 一步拿到系数、标准误、置信区间
+tbl <- tidy(model, 
+            exponentiate = FALSE,  # 先拿 log‑odds
+            conf.int     = TRUE)   # 拿到 conf.low, conf.high
+
+# 计算 z、p、OR储存到tbl2中
+tbl2 <- tbl %>%
+  mutate(
+    z       = estimate / std.error,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    OR      = exp(estimate),
+    CI_low  = exp(conf.low),
+    CI_high = exp(conf.high))
+
+# 简单森林图
+g3 <- ggplot(tbl2, aes(x = OR, y = term, color = y.level)) +
+  geom_errorbarh(aes(xmin = CI_low, xmax = CI_high),
+                 height = 0.3,          # 线端横线的“厚度”
+                 size   = 0.8,          # 误差线宽度
+                 position = position_dodge(width = 0.7)) +
+  geom_point(position = position_dodge(width = 0.7),
+             size = 3) +            # 点的大小
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  scale_x_log10(
+    # 缩小左右空白
+    expand = expansion(mult = c(0.1, 0.1))
+  ) +
+  labs(
+    x     = "Odds Ratio (对数尺度) 与 95% CI",
+    y     = "自变量项",
+    color = "分期 (stage)",
+    title = "多项逻辑回归：各因素对不同分期 vs Ⅰ期的 OR"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    # 适当压缩上下空白
+    plot.margin = margin(10, 10, 10, 10),
+    # 调整 y 轴文字与点更紧凑
+    axis.title.y = element_blank(),
+    axis.text.y  = element_text(margin = margin(r = 5)),
+    legend.position = "right"
+  )
+
+# 保存为 JPG 格式
+ggsave(
+  filename = "C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/graph/3.jpg",    # 文件名（扩展名决定格式）
+  plot = g3,                       # 绘图对象
+  width = 8,                       # 宽度（单位英寸）
+  height = 6,                      # 高度（单位英寸）
+  units = "in",                    # 单位（默认英寸）
+  dpi = 300                        # 分辨率（默认 300 dpi）
+)
+
+##获取各类别的概率
+# 使用 fitted() 获取模型的预测概率
+pred_probs <- fitted(model)
+
+# 将预测结果转化为数据框
+pred_data <- as.data.frame(pred_probs)
+colnames(pred_data) <- paste("stage", 1:ncol(pred_data), sep = "_")
+pred_data$gender <- rep(merged_data$gender, length.out = nrow(pred_data))
+pred_data$age_group <- rep(merged_data$age_group, length.out = nrow(pred_data))
+pred_data$year_c <- rep(merged_data$year_c, length.out = nrow(pred_data))
+
+# 将数据重塑为长格式，以便绘图
+pred_data_long <- pred_data %>%
+  pivot_longer(cols = starts_with("stage"), 
+               names_to = "stage", 
+               values_to = "probability")
+
+
+###-------------------可视化不同人群与癌症分期之间的关系-------------------###
+# 先计算真实年份的平均值
+year_mean <- mean(merged_data$year)
+
+# 绘图
+g4 <- ggplot(pred_data_long, aes(
+  x = year_c,
+  y = probability,
+  color = gender,
+  linetype = gender,
+  linewidth = age_group
+)) +
+  geom_line(show.legend = TRUE) +
+  facet_wrap(~ stage) +
+  scale_linewidth_manual(
+    values = c(
+      "<=40"  = 0.5,
+      "41-50" = 1.0,
+      "51-60" = 1.5,
+      "61+"   = 2.0
+    )
+  ) +
+  scale_x_continuous(
+    name = "年份",
+    breaks = seq(-6, 6, 2),  # 根据你的数据调整刻度范围
+    labels = function(x) round(x + year_mean)
+  ) +
+  labs(
+    title = "不同人群肺癌分期的概率趋势",
+    y = "概率",
+    color = "性别",
+    linetype = "性别",
+    linewidth = "年龄组"
+  ) +
+  theme_minimal(base_size = 14)
+# 保存为 JPG 格式
+ggsave(
+  filename = "C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/graph/4.jpg",    # 文件名（扩展名决定格式）
+  plot = g4,                       # 绘图对象
+  width = 8,                       # 宽度（单位英寸）
+  height = 6,                      # 高度（单位英寸）
+  units = "in",                    # 单位（默认英寸）
+  dpi = 300                        # 分辨率（默认 300 dpi）
+)
+
+
+###---------------------------------模型预测---------------------------------###
+# 构造未来年份的预测数据框
+future_years <- 2021:2030
+pred_data_future <- expand.grid(
+  gender    = levels(merged_data$gender),
+  age_group = levels(merged_data$age_group),
+  year      = future_years
+)
+
+# 去中心化年份（与训练数据保持一致）
+year_mean <- mean(merged_data$year)
+pred_data_future$year_c <- pred_data_future$year - year_mean
+
+# 使用模型预测每个癌症分期的概率
+pred_probs <- predict(model, newdata = pred_data_future, type = "probs")
+
+# 合并预测结果为一个数据框
+pred_data_end <- cbind(pred_data_future, as.data.frame(pred_probs))
+
+# 获取模型预测概率列名（非 predictor 列）
+prob_cols <- setdiff(colnames(pred_data_end), c("gender", "age_group", "year", "year_c"))
+
+# 整理为长表形式
+pred_data_end <- pred_data_end %>%
+  pivot_longer(
+    cols = all_of(prob_cols),
+    names_to = "stage",
+    values_to = "probability"
+  )
+
+## 真实值和预测值结合的不同癌症分期概率趋势图
+# 构建真实数据结尾部分的概率表
+real_data_end <- merged_data %>%
+  select(gender, age_group, year, year_c, stage, stage_prop) %>%
+  rename(probability = stage_prop) %>%
+  mutate(source = "真实")
+
+# 构建预测数据概率表
+pred_data_long2 <- pred_data_end %>%
+  mutate(source = "预测")
+
+# 合并过去与预测数据
+combined_data <- bind_rows(real_data_end, pred_data_long2)
+
+# 绘图：不同颜色表示真实/预测，线型区分性别，线宽区分年龄组
+g5 <- ggplot(combined_data, aes(
+  x = year,
+  y = probability,
+  color = source,
+  linetype = gender,
+  linewidth = age_group,
+  group = interaction(gender, age_group, source)
+)) +
+  geom_line() +
+  facet_wrap(~ stage) +
+  scale_linewidth_manual(values = c("<=40" = 0.5, "41-50" = 1.0, "51-60" = 1.5, "61+" = 2.0)) +
+  scale_color_manual(
+    values = c("#2E5D87", "#E48C2A"),
+    labels = c("过去值", "预测值")
+  ) +
+  labs(
+    title = "肺癌各分期的过去与预测概率趋势",
+    x = "年份",
+    y = "概率",
+    color = "数据来源",
+    linetype = "性别",
+    linewidth = "年龄组"
+  ) +
+  theme_minimal(base_size = 14)
+# 保存为 JPG 格式
+ggsave(
+  filename = "C:/Users/Barry/Desktop/“寿再青骏杯”选题二数据：肺癌保险研究/graph/5.jpg",    # 文件名（扩展名决定格式）
+  plot = g5,                       # 绘图对象
+  width = 8,                       # 宽度（单位英寸）
+  height = 6,                      # 高度（单位英寸）
+  units = "in",                    # 单位（默认英寸）
+  dpi = 300                        # 分辨率（默认 300 dpi）
+)
